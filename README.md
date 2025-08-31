@@ -267,18 +267,6 @@ jobs:
 - **Horizontal Scaling**: Microservice architecture for easy scaling
 - **Resource Management**: Efficient memory and CPU utilization
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ## 🙏 Acknowledgments
 
 - OpenAI for the powerful LLM capabilities
@@ -286,15 +274,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - FastAPI for the excellent web framework
 - ChromaDB for vector database capabilities
 - The open-source community for various dependencies
-
-## 📞 Support
-
-- **Documentation**: [Full Documentation](docs/)
-- **Issues**: [GitHub Issues](https://github.com/VinayakWankhade/Ai_Powered_Api_Testing_system/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/VinayakWankhade/Ai_Powered_Api_Testing_system/discussions)
-
----
-
-**Built with ❤️ by Vinayak Wankhade**
-
-*Transforming API testing with the power of AI and machine learning*
