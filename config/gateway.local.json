@@ -1,0 +1,28 @@
+{
+  "providers": {
+    "local": {
+      "type": "ollama",
+      "base_url": "http://localhost:11434",
+      "default_models": ["llama3.1:8b"],
+      "max_tokens": 4096,
+      "context_window": 8192,
+      "latency_ms_avg": 800
+    }
+  },
+  "prefer_local": true,
+  "cache_size": 1000,
+  "cache_ttl_hours": 24,
+  "worker_threads": 2,
+  "max_cost_per_request": 0.01,
+  "rate_limits": {
+    "local": { "requests_per_minute": 120, "window_seconds": 60 }
+  },
+  "cost_limits": {
+    "hourly": 0,
+    "daily": 0,
+    "weekly": 0,
+    "monthly": 0,
+    "total": 0
+  }
+}
+
