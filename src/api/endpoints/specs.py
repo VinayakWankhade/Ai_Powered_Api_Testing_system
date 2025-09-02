@@ -3,7 +3,7 @@ API endpoints for managing API specifications.
 """
 
 from typing import Dict, List, Any, Optional
-from fastapi import APIRouter, HTTPException, Depends, File, UploadFile
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -11,19 +11,24 @@ from ...database.connection import get_db
 from ...database.models import APISpecification, SpecType
 from ...core.spec_ingestion import APISpecIngester
 from ...utils.logger import get_logger
+from ..security import (
+    verify_api_key, optional_auth, limiter, 
+    SecureAPISpecRequest, InputValidator, 
+    SecurityAuditLogger, get_utc_timestamp
+)
 
 logger = get_logger(__name__)
 
 router = APIRouter()
 
-class SpecUploadRequest(BaseModel):
-    """Request model for uploading API specification."""
-    name: str = Field(..., description="Name of the API")
-    version: Optional[str] = Field("1.0.0", description="Version of the API")
-    description: Optional[str] = Field(None, description="Description of the API")
+class SpecUploadRequest(SecureAPISpecRequest):
+    """Secure request model for uploading API specification."""
+    name: str = Field(..., description="Name of the API", min_length=1, max_length=200)
+    version: Optional[str] = Field("1.0.0", description="Version of the API", max_length=50)
+    description: Optional[str] = Field(None, description="Description of the API", max_length=1000)
     spec_type: SpecType = Field(..., description="Type of specification")
     spec_content: str = Field(..., description="Specification content (JSON/YAML)")
-    base_url: Optional[str] = Field(None, description="Base URL for the API")
+    base_url: Optional[str] = Field(None, description="Base URL for the API", max_length=2048)
 
 class SpecUploadFromURLRequest(BaseModel):
     """Request model for uploading API specification from URL."""
@@ -47,16 +52,33 @@ class SpecResponse(BaseModel):
     endpoint_count: int
 
 @router.post("/upload-spec", response_model=SpecResponse)
+@limiter.limit("10/hour")
 async def upload_spec(
+    request_obj: Request,
     request: SpecUploadRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key)
 ):
     """
     Upload an API specification.
     
     Supports OpenAPI/Swagger specifications and raw API logs.
+    Requires authentication.
     """
     try:
+        # Audit log the upload attempt
+        SecurityAuditLogger.log_api_access(
+            endpoint="/upload-spec",
+            method="POST",
+            user_id=api_key
+        )
+        
+        # Additional validation
+        if request.base_url and not InputValidator.validate_url(request.base_url):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid base URL format"
+            )
         ingester = APISpecIngester()
         
         api_spec = ingester.ingest_spec(
@@ -185,11 +207,14 @@ async def upload_spec_file(
         )
 
 @router.get("/specs", response_model=List[SpecResponse])
+@limiter.limit("30/minute")
 async def list_specs(
+    request: Request,
     active_only: bool = True,
-    limit: int = 50,
-    offset: int = 0,
-    db: Session = Depends(get_db)
+    limit: int = Field(50, le=100),  # Max 100 results per request
+    offset: int = Field(0, ge=0),
+    db: Session = Depends(get_db),
+    api_key: Optional[str] = Depends(optional_auth)
 ):
     """
     List all API specifications.
@@ -228,9 +253,12 @@ async def list_specs(
         )
 
 @router.get("/specs/{spec_id}", response_model=SpecResponse)
+@limiter.limit("60/minute")
 async def get_spec(
-    spec_id: int,
-    db: Session = Depends(get_db)
+    request: Request,
+    spec_id: int = Field(..., gt=0),
+    db: Session = Depends(get_db),
+    api_key: Optional[str] = Depends(optional_auth)
 ):
     """
     Get a specific API specification by ID.
@@ -300,9 +328,12 @@ async def get_spec_endpoints(
         )
 
 @router.delete("/specs/{spec_id}")
+@limiter.limit("5/hour")
 async def delete_spec(
-    spec_id: int,
-    db: Session = Depends(get_db)
+    request: Request,
+    spec_id: int = Field(..., gt=0),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key)
 ):
     """
     Soft delete an API specification.

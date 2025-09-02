@@ -4,12 +4,16 @@ FastAPI application for the AI-Powered API Testing System.
 
 import os
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from ..database.connection import create_tables, get_db
 from ..database.models import SpecType, TestType, RLAlgorithm
@@ -18,8 +22,18 @@ from .endpoints import (
     test_healing, coverage, rl_optimization, dashboard
 )
 from ..utils.logger import get_logger
+from .security import (
+    SecurityConfig, SecurityMiddleware, limiter, 
+    get_secure_cors_origins, get_utc_timestamp, 
+    validate_environment, SecurityAuditLogger
+)
 
 logger = get_logger(__name__)
+
+# Validate environment and log security warnings
+env_validation = validate_environment()
+for warning in env_validation["warnings"]:
+    logger.warning(f"SECURITY: {warning}")
 
 # Initialize database
 create_tables()
@@ -38,13 +52,25 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# Configure CORS
+# Configure security middleware
+app.add_middleware(SecurityMiddleware)
+
+# Configure rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# Configure secure CORS
+secure_origins = get_secure_cors_origins()
+logger.info(f"Configuring CORS for origins: {secure_origins}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
+    allow_origins=secure_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
 
 # Include routers
@@ -82,17 +108,24 @@ async def root():
     }
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint."""
+@limiter.limit("10/minute")
+async def health_check(request: Request):
+    """Health check endpoint with rate limiting."""
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": get_utc_timestamp().isoformat(),
         "database": "connected",
-        "ai_services": "active"
+        "ai_services": "active",
+        "security": {
+            "authentication": "enabled" if SecurityConfig.VALID_API_KEYS or SecurityConfig.MASTER_API_KEY else "disabled",
+            "cors": "secured",
+            "rate_limiting": "enabled"
+        }
     }
 
 @app.get("/status")
-async def system_status():
+@limiter.limit("5/minute")
+async def system_status(request: Request):
     """Get detailed system status."""
     try:
         from ..database.connection import get_db_session
@@ -125,7 +158,7 @@ async def system_status():
                 "test_executor": "active",
                 "healing_system": "active"
             },
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": get_utc_timestamp().isoformat()
         }
         
     except Exception as e:
@@ -137,7 +170,7 @@ async def system_status():
                     "status": "degraded",
                     "error": str(e)
                 },
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": get_utc_timestamp().isoformat()
             }
         )
 
@@ -150,7 +183,8 @@ async def http_exception_handler(request, exc):
         content={
             "error": exc.detail,
             "status_code": exc.status_code,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": get_utc_timestamp().isoformat(),
+            "request_id": getattr(exc, 'request_id', None)
         }
     )
 
@@ -162,22 +196,49 @@ async def general_exception_handler(request, exc):
         status_code=500,
         content={
             "error": "Internal server error",
-            "message": str(exc),
-            "timestamp": datetime.utcnow().isoformat()
+            "message": "An unexpected error occurred" if not os.getenv("DEBUG") else str(exc),
+            "timestamp": get_utc_timestamp().isoformat(),
+            "support": "Contact support with this timestamp for assistance"
         }
     )
 
 if __name__ == "__main__":
     import uvicorn
+    from ..config.ssl_config import ssl_config
     
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
     debug = os.getenv("DEBUG", "false").lower() == "true"
     
-    uvicorn.run(
-        "src.api.main:app",
-        host=host,
-        port=port,
-        reload=debug,
-        log_level="debug" if debug else "info"
-    )
+    # SSL configuration
+    ssl_config_dict = ssl_config.get_uvicorn_ssl_config()
+    
+    # Validate SSL setup
+    ssl_validation = ssl_config.validate_certificates()
+    for issue in ssl_validation["issues"]:
+        logger.error(f"SSL ISSUE: {issue}")
+    for warning in ssl_validation["warnings"]:
+        logger.warning(f"SSL WARNING: {warning}")
+    
+    # Server configuration
+    server_config = {
+        "app": "src.api.main:app",
+        "host": host,
+        "port": port,
+        "reload": debug,
+        "log_level": "debug" if debug else "info",
+        "access_log": True,
+        "server_header": False,  # Hide server header for security
+        "date_header": False     # Hide date header for security
+    }
+    
+    # Add SSL configuration if available
+    if ssl_config_dict:
+        server_config.update(ssl_config_dict)
+        logger.info(f"Starting server with HTTPS on {host}:{port}")
+    else:
+        logger.info(f"Starting server with HTTP on {host}:{port}")
+        if os.getenv("ENVIRONMENT") == "production":
+            logger.error("WARNING: Running in production without HTTPS!")
+    
+    uvicorn.run(**server_config)
