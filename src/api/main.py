@@ -15,7 +15,7 @@ from ..database.connection import create_tables, get_db
 from ..database.models import SpecType, TestType, RLAlgorithm
 from .endpoints import (
     specs, test_generation, test_execution, 
-    test_healing, coverage, rl_optimization
+    test_healing, coverage, rl_optimization, dashboard
 )
 from ..utils.logger import get_logger
 
@@ -54,6 +54,7 @@ app.include_router(test_execution.router, prefix="/api/v1", tags=["Test Executio
 app.include_router(test_healing.router, prefix="/api/v1", tags=["Test Healing"])
 app.include_router(coverage.router, prefix="/api/v1", tags=["Coverage & Analytics"])
 app.include_router(rl_optimization.router, prefix="/api/v1", tags=["RL Optimization"])
+app.include_router(dashboard.router, prefix="/api/v1", tags=["Dashboard & Metrics"])
 
 @app.get("/")
 async def root():

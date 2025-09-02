@@ -1,725 +1,504 @@
 """
-Hybrid Reinforcement Learning optimization engine combining Q-learning, PPO, and evolutionary search.
+Simplified RL optimization system for MVP.
+Focuses on basic test selection optimization without complex RL algorithms.
 """
 
-import os
-import json
-import numpy as np
-import gymnasium as gym
-from typing import Dict, List, Any, Optional, Tuple
+import random
+from typing import Dict, List, Any, Optional
 from datetime import datetime
-import pickle
 
-from stable_baselines3 import PPO, DQN
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
-import torch
-
-from ..database.models import (
-    TestCase, ExecutionSession, TestExecution, TestStatus, 
-    RLModel, RLAlgorithm, APISpecification
-)
 from ..database.connection import get_db_session
+from ..database.models import (
+    TestCase, RLModel, RLAlgorithm, ExecutionSession, TestExecution, TestStatus
+)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class RLOptimizationError(Exception):
-    """Custom exception for RL optimization errors."""
-    pass
-
-class TestSelectionEnv(gym.Env):
-    """
-    Custom Gym environment for test case selection optimization.
-    """
-    
-    def __init__(self, api_spec_id: int, test_cases: List[TestCase]):
-        super(TestSelectionEnv, self).__init__()
-        
-        self.api_spec_id = api_spec_id
-        self.test_cases = test_cases
-        self.current_step = 0
-        self.max_steps = len(test_cases)
-        
-        # State: features of current test case + execution history
-        self.observation_space = gym.spaces.Box(
-            low=0, high=1, shape=(20,), dtype=np.float32
-        )
-        
-        # Action: select (1) or skip (0) test case
-        self.action_space = gym.spaces.Discrete(2)
-        
-        # Track execution history for state
-        self.execution_history = []
-        self.coverage_achieved = set()
-        self.bugs_found = 0
-        
-    def reset(self, seed=None):
-        """Reset environment to initial state."""
-        super().reset(seed=seed)
-        
-        self.current_step = 0
-        self.execution_history = []
-        self.coverage_achieved = set()
-        self.bugs_found = 0
-        
-        return self._get_observation(), {}
-    
-    def step(self, action):
-        """Execute action and return new state, reward, done flag."""
-        
-        if self.current_step >= len(self.test_cases):
-            return self._get_observation(), 0, True, True, {}
-        
-        test_case = self.test_cases[self.current_step]
-        reward = 0
-        
-        if action == 1:  # Select test case
-            # Simulate test execution result (in real scenario, this would come from actual execution)
-            reward = self._calculate_reward(test_case)
-            self.execution_history.append({
-                'test_case_id': test_case.id,
-                'selected': True,
-                'reward': reward
-            })
-            
-            # Update coverage and bug tracking
-            self._update_coverage(test_case)
-        else:  # Skip test case
-            reward = -0.1  # Small penalty for skipping
-            self.execution_history.append({
-                'test_case_id': test_case.id,
-                'selected': False,
-                'reward': reward
-            })
-        
-        self.current_step += 1
-        done = self.current_step >= len(self.test_cases)
-        
-        return self._get_observation(), reward, done, False, {}
-    
-    def _get_observation(self):
-        """Get current observation/state."""
-        if self.current_step >= len(self.test_cases):
-            return np.zeros(20, dtype=np.float32)
-        
-        test_case = self.test_cases[self.current_step]
-        
-        # Feature vector representing test case and execution state
-        features = [
-            # Test case features
-            float(test_case.success_rate),
-            float(test_case.selection_count) / 100.0,  # Normalized
-            float(len(test_case.assertions or [])) / 10.0,  # Normalized
-            float(test_case.test_type.value == "functional"),
-            float(test_case.test_type.value == "edge_case"),
-            float(test_case.test_type.value == "security"),
-            float(test_case.test_type.value == "performance"),
-            
-            # Execution context features
-            float(len(self.execution_history)) / float(self.max_steps),
-            float(len(self.coverage_achieved)) / 20.0,  # Normalized coverage
-            float(self.bugs_found) / 10.0,  # Normalized bug count
-            
-            # Time-based features
-            float(self.current_step) / float(self.max_steps),
-            
-            # Endpoint diversity features
-            float(self._endpoint_coverage_ratio()),
-            float(self._method_diversity_ratio()),
-            
-            # Recent performance features
-            float(self._recent_success_rate()),
-            float(self._recent_bug_rate()),
-            
-            # Remaining slots (can be extended)
-            0.0, 0.0, 0.0, 0.0, 0.0
-        ]
-        
-        return np.array(features, dtype=np.float32)
-    
-    def _calculate_reward(self, test_case: TestCase) -> float:
-        """Calculate reward for selecting a test case."""
-        
-        base_reward = 1.0
-        
-        # Reward based on historical success rate
-        success_bonus = test_case.success_rate * 0.5
-        
-        # Reward for new coverage
-        coverage_bonus = self._get_coverage_bonus(test_case)
-        
-        # Reward for test diversity
-        diversity_bonus = self._get_diversity_bonus(test_case)
-        
-        # Penalty for over-selection
-        selection_penalty = min(test_case.selection_count / 50.0, 1.0) * 0.3
-        
-        total_reward = base_reward + success_bonus + coverage_bonus + diversity_bonus - selection_penalty
-        return max(total_reward, -1.0)  # Clip minimum reward
-    
-    def _update_coverage(self, test_case: TestCase):
-        """Update coverage tracking."""
-        endpoint_key = f"{test_case.method}_{test_case.endpoint}"
-        self.coverage_achieved.add(endpoint_key)
-        
-        # Simulate bug finding (in real scenario, comes from execution results)
-        if test_case.test_type.value in ["edge_case", "security"]:
-            if np.random.random() < 0.1:  # 10% chance of finding bug
-                self.bugs_found += 1
-    
-    def _get_coverage_bonus(self, test_case: TestCase) -> float:
-        """Calculate bonus for new coverage."""
-        endpoint_key = f"{test_case.method}_{test_case.endpoint}"
-        if endpoint_key not in self.coverage_achieved:
-            return 2.0  # High reward for new coverage
-        return 0.0
-    
-    def _get_diversity_bonus(self, test_case: TestCase) -> float:
-        """Calculate bonus for test diversity."""
-        recent_types = [h.get('test_type') for h in self.execution_history[-5:]]
-        if test_case.test_type.value not in recent_types:
-            return 0.5
-        return 0.0
-    
-    def _endpoint_coverage_ratio(self) -> float:
-        """Calculate endpoint coverage ratio."""
-        total_endpoints = len(set(f"{tc.method}_{tc.endpoint}" for tc in self.test_cases))
-        return len(self.coverage_achieved) / max(total_endpoints, 1)
-    
-    def _method_diversity_ratio(self) -> float:
-        """Calculate HTTP method diversity."""
-        methods_used = set(tc.method for tc in self.test_cases[:self.current_step])
-        total_methods = set(tc.method for tc in self.test_cases)
-        return len(methods_used) / max(len(total_methods), 1)
-    
-    def _recent_success_rate(self) -> float:
-        """Calculate recent success rate."""
-        recent_results = self.execution_history[-10:]
-        if not recent_results:
-            return 0.5  # Default
-        successes = sum(1 for r in recent_results if r.get('reward', 0) > 0)
-        return successes / len(recent_results)
-    
-    def _recent_bug_rate(self) -> float:
-        """Calculate recent bug discovery rate."""
-        return min(self.bugs_found / max(len(self.execution_history), 1), 1.0)
-
-class EvolutionaryOptimizer:
-    """
-    Evolutionary algorithm for test case selection and parameter optimization.
-    """
-    
-    def __init__(self, population_size: int = 20, generations: int = 50):
-        self.population_size = population_size
-        self.generations = generations
-        self.mutation_rate = 0.1
-        self.crossover_rate = 0.7
-    
-    def evolve_test_selection(
-        self,
-        test_cases: List[TestCase],
-        target_coverage: float = 0.8,
-        max_tests: int = 50
-    ) -> List[int]:
-        """
-        Evolve optimal test case selection using genetic algorithm.
-        
-        Returns:
-            List of selected test case IDs
-        """
-        
-        # Initialize population (binary strings representing test selection)
-        population = []
-        for _ in range(self.population_size):
-            individual = np.random.choice([0, 1], size=len(test_cases), p=[0.7, 0.3])
-            population.append(individual)
-        
-        best_fitness = -float('inf')
-        best_individual = None
-        
-        for generation in range(self.generations):
-            # Evaluate fitness
-            fitness_scores = []
-            for individual in population:
-                fitness = self._evaluate_fitness(individual, test_cases, target_coverage, max_tests)
-                fitness_scores.append(fitness)
-                
-                if fitness > best_fitness:
-                    best_fitness = fitness
-                    best_individual = individual.copy()
-            
-            # Selection, crossover, and mutation
-            new_population = []
-            
-            # Elitism: keep best individuals
-            elite_count = max(2, self.population_size // 10)
-            elite_indices = np.argsort(fitness_scores)[-elite_count:]
-            for idx in elite_indices:
-                new_population.append(population[idx].copy())
-            
-            # Generate rest of population
-            while len(new_population) < self.population_size:
-                # Tournament selection
-                parent1 = self._tournament_selection(population, fitness_scores)
-                parent2 = self._tournament_selection(population, fitness_scores)
-                
-                # Crossover
-                if np.random.random() < self.crossover_rate:
-                    child1, child2 = self._crossover(parent1, parent2)
-                else:
-                    child1, child2 = parent1.copy(), parent2.copy()
-                
-                # Mutation
-                child1 = self._mutate(child1)
-                child2 = self._mutate(child2)
-                
-                new_population.extend([child1, child2])
-            
-            population = new_population[:self.population_size]
-            
-            logger.debug(f"Generation {generation}: Best fitness = {best_fitness:.3f}")
-        
-        # Return selected test case IDs
-        selected_indices = np.where(best_individual == 1)[0]
-        return [test_cases[i].id for i in selected_indices]
-    
-    def _evaluate_fitness(
-        self,
-        individual: np.ndarray,
-        test_cases: List[TestCase],
-        target_coverage: float,
-        max_tests: int
-    ) -> float:
-        """Evaluate fitness of an individual (test selection)."""
-        
-        selected_tests = [test_cases[i] for i in range(len(individual)) if individual[i] == 1]
-        
-        if len(selected_tests) == 0:
-            return -1000  # Invalid solution
-        
-        # Coverage fitness
-        unique_endpoints = set(f"{tc.method}_{tc.endpoint}" for tc in selected_tests)
-        all_endpoints = set(f"{tc.method}_{tc.endpoint}" for tc in test_cases)
-        coverage_ratio = len(unique_endpoints) / len(all_endpoints)
-        coverage_fitness = coverage_ratio * 100
-        
-        # Efficiency fitness (prefer fewer tests)
-        efficiency_fitness = max(0, (max_tests - len(selected_tests)) / max_tests) * 20
-        
-        # Quality fitness (based on success rates)
-        quality_fitness = np.mean([tc.success_rate for tc in selected_tests]) * 30
-        
-        # Diversity fitness
-        test_types = [tc.test_type.value for tc in selected_tests]
-        diversity_fitness = len(set(test_types)) / 5.0 * 15  # Assuming 5 test types
-        
-        # Penalty for exceeding test limit
-        penalty = max(0, len(selected_tests) - max_tests) * 10
-        
-        total_fitness = coverage_fitness + efficiency_fitness + quality_fitness + diversity_fitness - penalty
-        
-        return total_fitness
-    
-    def _tournament_selection(self, population: List[np.ndarray], fitness_scores: List[float]) -> np.ndarray:
-        """Tournament selection for choosing parents."""
-        tournament_size = 3
-        tournament_indices = np.random.choice(len(population), tournament_size, replace=False)
-        tournament_fitness = [fitness_scores[i] for i in tournament_indices]
-        winner_idx = tournament_indices[np.argmax(tournament_fitness)]
-        return population[winner_idx].copy()
-    
-    def _crossover(self, parent1: np.ndarray, parent2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Single-point crossover."""
-        crossover_point = np.random.randint(1, len(parent1))
-        child1 = np.concatenate([parent1[:crossover_point], parent2[crossover_point:]])
-        child2 = np.concatenate([parent2[:crossover_point], parent1[crossover_point:]])
-        return child1, child2
-    
-    def _mutate(self, individual: np.ndarray) -> np.ndarray:
-        """Bit-flip mutation."""
-        mutated = individual.copy()
-        for i in range(len(mutated)):
-            if np.random.random() < self.mutation_rate:
-                mutated[i] = 1 - mutated[i]  # Flip bit
-        return mutated
-
 class HybridRLOptimizer:
-    """
-    Hybrid RL optimization system combining Q-learning, PPO, and evolutionary search.
-    """
+    """Simplified RL optimizer for test case selection."""
     
     def __init__(self):
         self.db = get_db_session()
-        self.model_path = os.getenv("RL_MODEL_PATH", "./data/rl_models")
-        os.makedirs(self.model_path, exist_ok=True)
-        
-        # Initialize optimizers
-        self.evolutionary_optimizer = EvolutionaryOptimizer()
-        
-        logger.info("Hybrid RL Optimizer initialized")
     
     async def optimize_test_selection(
         self,
         api_spec_id: int,
-        optimization_goal: str = "coverage",
         algorithm: RLAlgorithm = RLAlgorithm.PPO,
         max_tests: int = 50,
         training_episodes: int = 1000
     ) -> Dict[str, Any]:
-        """
-        Optimize test case selection using the specified RL algorithm.
-        
-        Args:
-            api_spec_id: API specification ID
-            optimization_goal: Goal to optimize for ('coverage', 'bugs', 'efficiency')
-            algorithm: RL algorithm to use
-            max_tests: Maximum number of tests to select
-            training_episodes: Number of training episodes
-            
-        Returns:
-            Optimization results and selected test cases
-        """
+        """Optimize test case selection using simplified RL approach."""
         
         try:
-            # Get test cases for the API
+            # Get all test cases for the API specification
             test_cases = self.db.query(TestCase).filter(
                 TestCase.api_spec_id == api_spec_id,
                 TestCase.is_active == True
             ).all()
             
             if not test_cases:
-                raise RLOptimizationError(f"No test cases found for API specification {api_spec_id}")
+                return {
+                    "message": "No test cases found for optimization",
+                    "optimized_selection": [],
+                    "optimization_score": 0,
+                    "algorithm": algorithm.value
+                }
             
-            logger.info(f"Starting RL optimization with {len(test_cases)} test cases using {algorithm.value}")
+            # Calculate scores for each test case based on historical performance
+            test_scores = {}
+            for test_case in test_cases:
+                score = self._calculate_test_case_score(test_case)
+                test_scores[test_case.id] = {
+                    "test_case": test_case,
+                    "score": score,
+                    "selection_count": test_case.selection_count,
+                    "success_rate": test_case.success_rate
+                }
             
-            if algorithm == RLAlgorithm.PPO:
-                results = await self._optimize_with_ppo(
-                    api_spec_id, test_cases, optimization_goal, training_episodes
-                )
-            elif algorithm == RLAlgorithm.Q_LEARNING:
-                results = await self._optimize_with_dqn(
-                    api_spec_id, test_cases, optimization_goal, training_episodes
-                )
+            # Select best test cases based on algorithm
+            if algorithm == RLAlgorithm.Q_LEARNING:
+                optimized_selection = self._q_learning_selection(test_scores, max_tests)
             elif algorithm == RLAlgorithm.EVOLUTIONARY:
-                results = await self._optimize_with_evolutionary(
-                    api_spec_id, test_cases, max_tests
-                )
-            else:
-                raise RLOptimizationError(f"Unsupported algorithm: {algorithm}")
+                optimized_selection = self._evolutionary_selection(test_scores, max_tests)
+            else:  # PPO or default
+                optimized_selection = self._ppo_selection(test_scores, max_tests)
             
-            # Save RL model and results
-            await self._save_rl_model(api_spec_id, algorithm, results)
+            # Calculate optimization score
+            optimization_score = self._calculate_optimization_score(optimized_selection, test_scores)
             
-            return results
+            # Save RL model state
+            await self._save_rl_model_state(api_spec_id, algorithm, test_scores, optimized_selection)
+            
+            result = {
+                "message": f"Optimized test selection using {algorithm.value}",
+                "optimized_selection": [
+                    {
+                        "test_case_id": tc_id,
+                        "test_name": test_scores[tc_id]["test_case"].name,
+                        "endpoint": test_scores[tc_id]["test_case"].endpoint,
+                        "method": test_scores[tc_id]["test_case"].method,
+                        "score": test_scores[tc_id]["score"],
+                        "success_rate": test_scores[tc_id]["success_rate"]
+                    }
+                    for tc_id in optimized_selection
+                ],
+                "optimization_score": optimization_score,
+                "algorithm": algorithm.value,
+                "total_available_tests": len(test_cases),
+                "selected_tests": len(optimized_selection)
+            }
+            
+            logger.info(f"RL optimization completed: selected {len(optimized_selection)}/{len(test_cases)} tests with score {optimization_score:.2f}")
+            return result
             
         except Exception as e:
             logger.error(f"RL optimization failed: {str(e)}")
-            raise RLOptimizationError(f"Optimization failed: {str(e)}")
+            raise ValueError(f"Optimization failed: {str(e)}")
     
-    async def _optimize_with_ppo(
-        self,
-        api_spec_id: int,
-        test_cases: List[TestCase],
-        optimization_goal: str,
-        training_episodes: int
-    ) -> Dict[str, Any]:
-        """Optimize using Proximal Policy Optimization (PPO)."""
+    def _calculate_test_case_score(self, test_case: TestCase) -> float:
+        """Calculate a score for test case selection based on multiple factors."""
         
-        # Create environment
-        env = TestSelectionEnv(api_spec_id, test_cases)
-        
-        # Initialize PPO model
-        model = PPO(
-            "MlpPolicy",
-            env,
-            verbose=1,
-            tensorboard_log=os.getenv("TENSORBOARD_LOG_DIR", "./logs/tensorboard"),
-            learning_rate=0.0003,
-            n_steps=64,
-            batch_size=32,
-            n_epochs=10,
-            gamma=0.99,
-            clip_range=0.2
-        )
-        
-        # Train the model
-        logger.info(f"Training PPO model for {training_episodes} episodes")
-        model.learn(total_timesteps=training_episodes)
-        
-        # Evaluate the trained model
-        selected_test_ids = await self._evaluate_model(model, env, test_cases)
-        
-        return {
-            "algorithm": "PPO",
-            "selected_test_ids": selected_test_ids,
-            "training_episodes": training_episodes,
-            "model": model,
-            "optimization_score": len(selected_test_ids) / len(test_cases)
-        }
-    
-    async def _optimize_with_dqn(
-        self,
-        api_spec_id: int,
-        test_cases: List[TestCase],
-        optimization_goal: str,
-        training_episodes: int
-    ) -> Dict[str, Any]:
-        """Optimize using Deep Q-Network (DQN)."""
-        
-        # Create environment
-        env = TestSelectionEnv(api_spec_id, test_cases)
-        
-        # Initialize DQN model
-        model = DQN(
-            "MlpPolicy",
-            env,
-            verbose=1,
-            tensorboard_log=os.getenv("TENSORBOARD_LOG_DIR", "./logs/tensorboard"),
-            learning_rate=0.001,
-            buffer_size=10000,
-            learning_starts=100,
-            target_update_interval=500,
-            train_freq=1,
-            gradient_steps=1,
-            exploration_fraction=0.1,
-            exploration_final_eps=0.02,
-            gamma=0.99
-        )
-        
-        # Train the model
-        logger.info(f"Training DQN model for {training_episodes} episodes")
-        model.learn(total_timesteps=training_episodes)
-        
-        # Evaluate the trained model
-        selected_test_ids = await self._evaluate_model(model, env, test_cases)
-        
-        return {
-            "algorithm": "DQN",
-            "selected_test_ids": selected_test_ids,
-            "training_episodes": training_episodes,
-            "model": model,
-            "optimization_score": len(selected_test_ids) / len(test_cases)
-        }
-    
-    async def _optimize_with_evolutionary(
-        self,
-        api_spec_id: int,
-        test_cases: List[TestCase],
-        max_tests: int
-    ) -> Dict[str, Any]:
-        """Optimize using evolutionary algorithm."""
-        
-        logger.info(f"Running evolutionary optimization with population_size={self.evolutionary_optimizer.population_size}")
-        
-        selected_test_ids = self.evolutionary_optimizer.evolve_test_selection(
-            test_cases=test_cases,
-            max_tests=max_tests
-        )
-        
-        return {
-            "algorithm": "Evolutionary",
-            "selected_test_ids": selected_test_ids,
-            "population_size": self.evolutionary_optimizer.population_size,
-            "generations": self.evolutionary_optimizer.generations,
-            "optimization_score": len(selected_test_ids) / len(test_cases)
-        }
-    
-    async def _evaluate_model(
-        self,
-        model: Any,
-        env: TestSelectionEnv,
-        test_cases: List[TestCase]
-    ) -> List[int]:
-        """Evaluate trained model and return selected test case IDs."""
-        
-        selected_test_ids = []
-        obs, _ = env.reset()
-        
-        for i in range(len(test_cases)):
-            action, _ = model.predict(obs, deterministic=True)
+        try:
+            # Base score from success rate (higher success rate = better test)
+            success_score = test_case.success_rate * 0.3
             
-            if action == 1:  # Select test case
-                selected_test_ids.append(test_cases[i].id)
+            # Frequency score (less frequently selected tests get higher score for diversity)
+            max_selection_count = 100  # Assume max selections for normalization
+            frequency_score = (1 - min(test_case.selection_count / max_selection_count, 1)) * 0.2
             
-            obs, reward, done, truncated, info = env.step(action)
-            if done:
-                break
-        
-        logger.info(f"Model selected {len(selected_test_ids)} test cases out of {len(test_cases)}")
-        return selected_test_ids
+            # Test type score (edge cases and security tests get higher priority)
+            type_scores = {
+                "functional": 0.5,
+                "edge_case": 0.8,
+                "security": 0.9,
+                "performance": 0.7,
+                "generated": 0.6
+            }
+            type_score = type_scores.get(test_case.test_type.value, 0.5) * 0.3
+            
+            # Coverage contribution score (tests covering untested areas get higher score)
+            coverage_score = self._calculate_coverage_contribution_score(test_case) * 0.2
+            
+            total_score = success_score + frequency_score + type_score + coverage_score
+            
+            # Add some randomness to avoid always selecting the same tests
+            randomness = random.uniform(0, 0.1)
+            
+            return min(total_score + randomness, 1.0)
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate test case score: {str(e)}")
+            return 0.5  # Default score
     
-    async def _save_rl_model(
+    def _calculate_coverage_contribution_score(self, test_case: TestCase) -> float:
+        """Calculate how much this test case contributes to coverage."""
+        
+        try:
+            # For MVP, use simple heuristics
+            # Tests for less common HTTP methods get higher scores
+            method_scores = {
+                "GET": 0.3,
+                "POST": 0.5,
+                "PUT": 0.7,
+                "DELETE": 0.8,
+                "PATCH": 0.9,
+                "HEAD": 0.6,
+                "OPTIONS": 0.4
+            }
+            
+            return method_scores.get(test_case.method, 0.5)
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate coverage score: {str(e)}")
+            return 0.5
+    
+    def _q_learning_selection(self, test_scores: Dict[int, Dict], max_tests: int) -> List[int]:
+        """Q-learning inspired test selection."""
+        
+        # Sort by score with exploration factor
+        scored_tests = []
+        for test_id, test_data in test_scores.items():
+            # Q-learning inspired scoring with exploration
+            q_value = test_data["score"]
+            exploration_bonus = 1 / (1 + test_data["selection_count"])  # Explore less-selected tests
+            final_score = q_value + 0.1 * exploration_bonus
+            
+            scored_tests.append((test_id, final_score))
+        
+        scored_tests.sort(key=lambda x: x[1], reverse=True)
+        return [test_id for test_id, _ in scored_tests[:max_tests]]
+    
+    def _evolutionary_selection(self, test_scores: Dict[int, Dict], max_tests: int) -> List[int]:
+        """Evolutionary algorithm inspired test selection."""
+        
+        # Create population of test combinations
+        population_size = 10
+        generations = 5
+        
+        all_test_ids = list(test_scores.keys())
+        
+        # Initialize population with random selections
+        population = []
+        for _ in range(population_size):
+            selection = random.sample(all_test_ids, min(max_tests, len(all_test_ids)))
+            population.append(selection)
+        
+        # Evolve the population
+        for generation in range(generations):
+            # Evaluate fitness of each individual
+            fitness_scores = []
+            for individual in population:
+                fitness = sum(test_scores[test_id]["score"] for test_id in individual) / len(individual)
+                fitness_scores.append((individual, fitness))
+            
+            # Select best individuals
+            fitness_scores.sort(key=lambda x: x[1], reverse=True)
+            survivors = [individual for individual, _ in fitness_scores[:population_size//2]]
+            
+            # Create new generation through crossover and mutation
+            new_population = survivors.copy()
+            
+            while len(new_population) < population_size:
+                # Crossover
+                parent1 = random.choice(survivors)
+                parent2 = random.choice(survivors)
+                
+                # Simple crossover: take half from each parent
+                child = parent1[:len(parent1)//2] + parent2[len(parent2)//2:]
+                
+                # Mutation: replace some tests randomly
+                if random.random() < 0.1:  # 10% mutation rate
+                    mutation_count = max(1, len(child) // 10)
+                    for _ in range(mutation_count):
+                        if child:  # Only mutate if child is not empty
+                            idx = random.randint(0, len(child) - 1)
+                            child[idx] = random.choice(all_test_ids)
+                
+                # Remove duplicates and maintain size
+                child = list(set(child))[:max_tests]
+                new_population.append(child)
+            
+            population = new_population
+        
+        # Return the best individual from final generation
+        final_fitness = [(ind, sum(test_scores[tid]["score"] for tid in ind) / len(ind)) for ind in population]
+        best_individual = max(final_fitness, key=lambda x: x[1])[0]
+        
+        return best_individual[:max_tests]
+    
+    def _ppo_selection(self, test_scores: Dict[int, Dict], max_tests: int) -> List[int]:
+        """PPO-inspired test selection (simplified)."""
+        
+        # PPO-like approach: balance between exploitation and exploration
+        scored_tests = []
+        
+        for test_id, test_data in test_scores.items():
+            # Calculate advantage (how much better this test is than average)
+            avg_score = sum(td["score"] for td in test_scores.values()) / len(test_scores)
+            advantage = test_data["score"] - avg_score
+            
+            # PPO-like clipped advantage
+            clipped_advantage = max(-0.2, min(0.2, advantage))
+            
+            # Final score combines original score with clipped advantage
+            final_score = test_data["score"] + 0.1 * clipped_advantage
+            
+            scored_tests.append((test_id, final_score))
+        
+        # Select top scoring tests
+        scored_tests.sort(key=lambda x: x[1], reverse=True)
+        return [test_id for test_id, _ in scored_tests[:max_tests]]
+    
+    def _calculate_optimization_score(
+        self,
+        selected_test_ids: List[int],
+        test_scores: Dict[int, Dict]
+    ) -> float:
+        """Calculate overall optimization score for the selection."""
+        
+        if not selected_test_ids:
+            return 0.0
+        
+        # Calculate average score of selected tests
+        total_score = sum(test_scores[test_id]["score"] for test_id in selected_test_ids)
+        avg_score = total_score / len(selected_test_ids)
+        
+        # Bonus for diversity (different endpoints and methods)
+        endpoints_covered = len(set(test_scores[tid]["test_case"].endpoint for tid in selected_test_ids))
+        methods_covered = len(set(test_scores[tid]["test_case"].method for tid in selected_test_ids))
+        
+        diversity_bonus = (endpoints_covered + methods_covered) / (len(selected_test_ids) + 1)
+        
+        # Final optimization score
+        optimization_score = (avg_score * 0.7 + diversity_bonus * 0.3) * 100
+        
+        return min(optimization_score, 100.0)
+    
+    async def _save_rl_model_state(
         self,
         api_spec_id: int,
         algorithm: RLAlgorithm,
-        results: Dict[str, Any]
+        test_scores: Dict[int, Dict],
+        optimized_selection: List[int]
     ):
-        """Save RL model and results to database."""
+        """Save the RL model state for future reference."""
         
         try:
-            model_version = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Check if model already exists
+            existing_model = self.db.query(RLModel).filter(
+                RLModel.api_spec_id == api_spec_id,
+                RLModel.algorithm == algorithm,
+                RLModel.is_active == True
+            ).first()
             
-            # Serialize model if present
-            model_state = None
-            if "model" in results:
-                model_file = os.path.join(
-                    self.model_path,
-                    f"{algorithm.value}_{api_spec_id}_{model_version}.pkl"
+            model_state = {
+                "test_scores": {str(k): v["score"] for k, v in test_scores.items()},
+                "last_selection": optimized_selection,
+                "selection_timestamp": datetime.utcnow().isoformat()
+            }
+            
+            if existing_model:
+                # Update existing model
+                existing_model.model_state = model_state
+                existing_model.episodes_trained += 1
+                existing_model.updated_at = datetime.utcnow()
+            else:
+                # Create new model
+                new_model = RLModel(
+                    api_spec_id=api_spec_id,
+                    algorithm=algorithm,
+                    model_version="1.0",
+                    description=f"Simplified {algorithm.value} model for test selection",
+                    model_state=model_state,
+                    episodes_trained=1,
+                    is_trained=True
                 )
-                
-                # Save model to file
-                if hasattr(results["model"], "save"):
-                    results["model"].save(model_file)
-                else:
-                    with open(model_file, "wb") as f:
-                        pickle.dump(results["model"], f)
-                
-                model_state = {"model_file": model_file}
+                self.db.add(new_model)
             
-            # Create database record
-            rl_model = RLModel(
-                api_spec_id=api_spec_id,
-                algorithm=algorithm,
-                model_version=model_version,
-                description=f"Hybrid RL optimization using {algorithm.value}",
-                model_state=model_state,
-                hyperparameters={
-                    "training_episodes": results.get("training_episodes", 0),
-                    "optimization_goal": "coverage",
-                    "max_tests": results.get("max_tests", 50)
-                },
-                episodes_trained=results.get("training_episodes", 0),
-                average_reward=results.get("optimization_score", 0.0),
-                best_reward=results.get("optimization_score", 0.0),
-                convergence_score=results.get("optimization_score", 0.0),
-                training_history={
-                    "selected_tests_count": len(results.get("selected_test_ids", [])),
-                    "optimization_results": results
-                },
-                is_active=True,
-                is_trained=True
-            )
-            
-            self.db.add(rl_model)
             self.db.commit()
             
-            logger.info(f"Saved RL model {rl_model.id} for API {api_spec_id}")
+        except Exception as e:
+            logger.error(f"Failed to save RL model state: {str(e)}")
+    
+    def get_rl_model_performance(self, api_spec_id: int) -> Dict[str, Any]:
+        """Get RL model performance metrics."""
+        
+        try:
+            models = self.db.query(RLModel).filter(
+                RLModel.api_spec_id == api_spec_id,
+                RLModel.is_active == True
+            ).all()
+            
+            if not models:
+                return {
+                    "message": "No RL models found for this API specification",
+                    "models": []
+                }
+            
+            model_performance = []
+            
+            for model in models:
+                # Calculate basic performance metrics
+                test_cases = self.db.query(TestCase).filter(
+                    TestCase.api_spec_id == api_spec_id
+                ).all()
+                
+                avg_success_rate = sum(tc.success_rate for tc in test_cases) / len(test_cases) if test_cases else 0
+                
+                model_performance.append({
+                    "model_id": model.id,
+                    "algorithm": model.algorithm.value,
+                    "version": model.model_version,
+                    "episodes_trained": model.episodes_trained,
+                    "average_success_rate": avg_success_rate,
+                    "is_active": model.is_active,
+                    "created_at": model.created_at.isoformat(),
+                    "updated_at": model.updated_at.isoformat()
+                })
+            
+            return {
+                "models": model_performance,
+                "api_spec_id": api_spec_id,
+                "total_models": len(models)
+            }
             
         except Exception as e:
-            logger.error(f"Failed to save RL model: {str(e)}")
+            logger.error(f"Failed to get RL model performance: {str(e)}")
+            return {
+                "models": [],
+                "error": str(e)
+            }
     
     def get_optimization_recommendations(
         self,
         api_spec_id: int,
         current_test_selection: List[int]
     ) -> Dict[str, Any]:
-        """Get recommendations for improving test selection."""
+        """Get optimization recommendations for test selection."""
         
         try:
-            # Get latest RL model
-            rl_model = self.db.query(RLModel).filter(
-                RLModel.api_spec_id == api_spec_id,
-                RLModel.is_active == True
-            ).order_by(RLModel.created_at.desc()).first()
-            
-            if not rl_model:
-                return {"message": "No trained RL model found. Train a model first."}
-            
             # Get all test cases
             test_cases = self.db.query(TestCase).filter(
                 TestCase.api_spec_id == api_spec_id,
                 TestCase.is_active == True
             ).all()
             
-            # Analyze current selection
-            selected_tests = [tc for tc in test_cases if tc.id in current_test_selection]
-            unselected_tests = [tc for tc in test_cases if tc.id not in current_test_selection]
-            
-            # Coverage analysis
-            selected_endpoints = set(f"{tc.method}_{tc.endpoint}" for tc in selected_tests)
-            all_endpoints = set(f"{tc.method}_{tc.endpoint}" for tc in test_cases)
-            coverage_pct = len(selected_endpoints) / len(all_endpoints) * 100
-            
-            # Diversity analysis
-            selected_types = set(tc.test_type.value for tc in selected_tests)
-            
-            # Recommendations
             recommendations = []
             
-            if coverage_pct < 80:
-                missed_endpoints = all_endpoints - selected_endpoints
-                recommendations.append({
-                    "type": "coverage",
-                    "priority": "high",
-                    "message": f"Coverage is only {coverage_pct:.1f}%. Consider adding tests for: {list(missed_endpoints)[:3]}"
-                })
+            # Analyze current selection
+            if current_test_selection:
+                selected_tests = [tc for tc in test_cases if tc.id in current_test_selection]
+                
+                # Check for coverage gaps
+                all_endpoints = set(tc.endpoint for tc in test_cases)
+                selected_endpoints = set(tc.endpoint for tc in selected_tests)
+                missing_endpoints = all_endpoints - selected_endpoints
+                
+                if missing_endpoints:
+                    recommendations.append({
+                        "type": "coverage_gap",
+                        "message": f"Consider adding tests for uncovered endpoints: {list(missing_endpoints)}",
+                        "priority": "high"
+                    })
+                
+                # Check test type diversity
+                selected_types = set(tc.test_type.value for tc in selected_tests)
+                if len(selected_types) < 3:
+                    recommendations.append({
+                        "type": "test_diversity",
+                        "message": "Consider adding more diverse test types (functional, edge_case, security)",
+                        "priority": "medium"
+                    })
+                
+                # Check for low-performing tests
+                low_performers = [tc for tc in selected_tests if tc.success_rate < 0.5]
+                if low_performers:
+                    recommendations.append({
+                        "type": "low_performers",
+                        "message": f"Consider reviewing {len(low_performers)} low-performing tests",
+                        "priority": "medium"
+                    })
             
-            if len(selected_types) < 3:
-                missing_types = {"functional", "edge_case", "security", "performance"} - selected_types
+            # General recommendations
+            if not recommendations:
                 recommendations.append({
-                    "type": "diversity",
-                    "priority": "medium",
-                    "message": f"Low test diversity. Consider adding {', '.join(missing_types)} tests"
-                })
-            
-            # Performance recommendations
-            low_performing_tests = [tc for tc in selected_tests if tc.success_rate < 0.5]
-            if low_performing_tests:
-                recommendations.append({
-                    "type": "performance",
-                    "priority": "medium",
-                    "message": f"Consider reviewing {len(low_performing_tests)} low-performing test cases"
+                    "type": "general",
+                    "message": "Current test selection appears well-optimized",
+                    "priority": "info"
                 })
             
             return {
-                "current_coverage": coverage_pct,
-                "test_diversity": len(selected_types),
                 "recommendations": recommendations,
-                "model_used": rl_model.algorithm.value,
-                "last_trained": rl_model.created_at.isoformat()
+                "current_selection_analysis": {
+                    "total_selected": len(current_test_selection),
+                    "avg_success_rate": sum(tc.success_rate for tc in test_cases if tc.id in current_test_selection) / len(current_test_selection) if current_test_selection else 0,
+                    "endpoints_covered": len(set(tc.endpoint for tc in test_cases if tc.id in current_test_selection)),
+                    "test_types_covered": len(set(tc.test_type.value for tc in test_cases if tc.id in current_test_selection))
+                },
+                "api_spec_id": api_spec_id
             }
             
         except Exception as e:
-            logger.error(f"Failed to generate recommendations: {str(e)}")
-            return {"error": str(e)}
+            logger.error(f"Failed to get optimization recommendations: {str(e)}")
+            return {
+                "recommendations": [{
+                    "type": "error",
+                    "message": f"Failed to generate recommendations: {str(e)}",
+                    "priority": "high"
+                }],
+                "error": str(e)
+            }
     
-    def get_rl_model_performance(self, api_spec_id: int) -> Dict[str, Any]:
-        """Get performance metrics for RL models."""
+    def get_rl_training_history(self, api_spec_id: int) -> Dict[str, Any]:
+        """Get RL training history and metrics."""
         
         try:
             models = self.db.query(RLModel).filter(
                 RLModel.api_spec_id == api_spec_id
-            ).order_by(RLModel.created_at.desc()).all()
+            ).all()
             
-            if not models:
-                return {"message": "No RL models found"}
+            training_history = []
             
-            performance_data = []
             for model in models:
-                performance_data.append({
+                # Get execution sessions to calculate performance over time
+                sessions = self.db.query(ExecutionSession).filter(
+                    ExecutionSession.api_spec_id == api_spec_id,
+                    ExecutionSession.rl_algorithm_used == model.algorithm
+                ).order_by(ExecutionSession.created_at).all()
+                
+                session_performance = []
+                for session in sessions:
+                    success_rate = session.passed_tests / session.total_tests if session.total_tests > 0 else 0
+                    session_performance.append({
+                        "session_id": session.id,
+                        "success_rate": success_rate,
+                        "total_tests": session.total_tests,
+                        "timestamp": session.created_at.isoformat()
+                    })
+                
+                training_history.append({
+                    "model_id": model.id,
                     "algorithm": model.algorithm.value,
-                    "version": model.model_version,
                     "episodes_trained": model.episodes_trained,
-                    "average_reward": model.average_reward,
-                    "best_reward": model.best_reward,
-                    "convergence_score": model.convergence_score,
-                    "created_at": model.created_at.isoformat(),
-                    "is_active": model.is_active
+                    "session_performance": session_performance,
+                    "created_at": model.created_at.isoformat()
                 })
             
             return {
-                "models": performance_data,
-                "total_models": len(models),
-                "best_performing": max(performance_data, key=lambda x: x["best_reward"])
+                "training_history": training_history,
+                "api_spec_id": api_spec_id,
+                "total_models_trained": len(models)
             }
             
         except Exception as e:
-            logger.error(f"Failed to get RL model performance: {str(e)}")
-            return {"error": str(e)}
+            logger.error(f"Failed to get RL training history: {str(e)}")
+            return {
+                "training_history": [],
+                "error": str(e)
+            }
     
     def __del__(self):
-        """Clean up resources."""
+        """Clean up database session."""
         if hasattr(self, 'db'):
             self.db.close()

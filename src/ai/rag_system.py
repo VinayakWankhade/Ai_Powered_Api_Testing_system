@@ -1,14 +1,28 @@
 """
 Retrieval-Augmented Generation (RAG) system for API testing.
+Simplified version for MVP that handles missing dependencies gracefully.
 """
 
 import os
-import numpy as np
 import json
 from typing import List, Dict, Any, Optional, Tuple
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+
+# Import dependencies with graceful fallback
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SentenceTransformer = None
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    chromadb = None
+    Settings = None
+    CHROMADB_AVAILABLE = False
 
 from ..database.models import DocumentationStore, APISpecification
 from ..database.connection import get_db_session
@@ -24,23 +38,44 @@ class RAGSystem:
 
     def __init__(self, embedding_model_name: str = "all-MiniLM-L6-v2"):
         self.embedding_model_name = embedding_model_name
-        self.embedding_model = SentenceTransformer(embedding_model_name)
         self.db = get_db_session()
         
-        # Initialize ChromaDB
-        chromadb_path = os.getenv("CHROMADB_PATH", "./data/chromadb")
-        self.chroma_client = chromadb.PersistentClient(
-            path=chromadb_path,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        # Initialize with fallback for missing dependencies
+        self.embedding_model = None
+        self.chroma_client = None
+        self.collection = None
+        self.fallback_mode = False
         
-        # Create or get collection
-        self.collection = self.chroma_client.get_or_create_collection(
-            name="api_documentation",
-            metadata={"description": "API documentation and examples for test generation"}
-        )
+        if not SENTENCE_TRANSFORMERS_AVAILABLE or not CHROMADB_AVAILABLE:
+            logger.warning("RAG dependencies not available. Running in fallback mode with limited functionality.")
+            self.fallback_mode = True
+            return
         
-        logger.info(f"RAG system initialized with model: {embedding_model_name}")
+        try:
+            # Initialize embedding model
+            self.embedding_model = SentenceTransformer(embedding_model_name)
+            
+            # Initialize ChromaDB
+            chromadb_path = os.getenv("CHROMADB_PATH", "./data/chromadb")
+            self.chroma_client = chromadb.PersistentClient(
+                path=chromadb_path,
+                settings=Settings(anonymized_telemetry=False)
+            )
+            
+            # Create or get collection
+            self.collection = self.chroma_client.get_or_create_collection(
+                name="api_documentation",
+                metadata={"description": "API documentation and examples for test generation"}
+            )
+            
+            logger.info(f"RAG system initialized with model: {embedding_model_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG system: {str(e)}. Falling back to simple mode.")
+            self.fallback_mode = True
+            self.embedding_model = None
+            self.chroma_client = None
+            self.collection = None
 
     def add_documents_to_vector_store(
         self,
@@ -57,6 +92,10 @@ class RAGSystem:
         Returns:
             Number of documents added/updated
         """
+        if self.fallback_mode:
+            logger.warning("Vector store not available in fallback mode")
+            return 0
+            
         try:
             # Get all documentation for the API specification
             docs = self.db.query(DocumentationStore).filter(
@@ -132,6 +171,44 @@ class RAGSystem:
         Returns:
             List of relevant documents with metadata and similarity scores
         """
+        if self.fallback_mode:
+            # Simple database search as fallback
+            try:
+                from sqlalchemy import or_
+                query_filter = or_(
+                    DocumentationStore.content.ilike(f"%{query}%"),
+                    DocumentationStore.title.ilike(f"%{query}%")
+                )
+                
+                db_query = self.db.query(DocumentationStore).filter(query_filter)
+                
+                if api_spec_id:
+                    db_query = db_query.filter(DocumentationStore.api_spec_id == api_spec_id)
+                
+                if doc_types:
+                    db_query = db_query.filter(DocumentationStore.doc_type.in_(doc_types))
+                
+                docs = db_query.limit(top_k).all()
+                
+                return [
+                    {
+                        "id": f"fallback_doc_{doc.id}",
+                        "content": doc.content,
+                        "metadata": {
+                            "doc_id": doc.id,
+                            "doc_type": doc.doc_type,
+                            "title": doc.title,
+                            "api_spec_id": doc.api_spec_id
+                        },
+                        "similarity_score": 0.5  # Default score for fallback
+                    }
+                    for doc in docs
+                ]
+                
+            except Exception as e:
+                logger.error(f"Fallback document search failed: {str(e)}")
+                return []
+        
         try:
             # Generate embedding for the query
             query_embedding = self.embedding_model.encode(query).tolist()

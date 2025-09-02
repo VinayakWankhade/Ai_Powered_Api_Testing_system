@@ -1,56 +1,49 @@
 """
-AI-powered test case generator using LLM and RAG.
+AI-powered test case generation using OpenAI GPT models.
+Simplified version for MVP without complex dependencies.
 """
 
-import os
 import json
-import asyncio
-from typing import Dict, List, Any, Optional, Union
+import os
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 
-import openai
-from langchain.llms import OpenAI
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import PromptTemplate, ChatPromptTemplate
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.callbacks import get_openai_callback
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
-from ..database.models import (
-    APISpecification, TestCase, TestType, AIGenerationLog
-)
 from ..database.connection import get_db_session
-from .rag_system import RAGSystem
+from ..database.models import (
+    APISpecification, TestCase, TestType, 
+    AIGenerationLog
+)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class TestGenerationError(Exception):
-    """Custom exception for test generation errors."""
-    pass
-
 class AITestGenerator:
-    """
-    AI-powered test case generator that uses LLM with RAG for context-aware test generation.
-    """
-
+    """AI-powered test case generator using OpenAI."""
+    
     def __init__(self):
         self.db = get_db_session()
-        self.rag_system = RAGSystem()
+        self.openai_client = None
         
-        # Initialize OpenAI
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        if not openai.api_key:
-            raise TestGenerationError("OPENAI_API_KEY environment variable is required")
-        
-        self.model_name = os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
-        self.chat_model = ChatOpenAI(
-            model_name=self.model_name,
-            temperature=0.7,
-            max_tokens=2000
-        )
-        
-        logger.info(f"AI Test Generator initialized with model: {self.model_name}")
-
+        # Initialize OpenAI client if available and API key is configured
+        if OPENAI_AVAILABLE:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if api_key and api_key != "your_openai_api_key_here":
+                try:
+                    self.openai_client = OpenAI(api_key=api_key)
+                    logger.info("OpenAI client initialized successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize OpenAI client: {str(e)}")
+            else:
+                logger.warning("OpenAI API key not configured. Using template-based generation.")
+        else:
+            logger.warning("OpenAI library not available. Using template-based generation.")
+    
     async def generate_test_cases(
         self,
         api_spec_id: int,
@@ -61,401 +54,75 @@ class AITestGenerator:
         include_edge_cases: bool = True,
         custom_context: Optional[str] = None
     ) -> List[TestCase]:
-        """
-        Generate test cases for a specific API endpoint.
+        """Generate test cases for a specific endpoint."""
         
-        Args:
-            api_spec_id: API specification ID
-            endpoint_path: API endpoint path
-            method: HTTP method
-            test_types: Types of tests to generate
-            count: Number of test cases to generate
-            include_edge_cases: Whether to include edge cases
-            custom_context: Additional context for generation
-            
-        Returns:
-            List of generated test cases
-        """
-        try:
-            # Get API specification
-            api_spec = self.db.query(APISpecification).filter(
-                APISpecification.id == api_spec_id
-            ).first()
-            
-            if not api_spec:
-                raise TestGenerationError(f"API specification with ID {api_spec_id} not found")
-            
-            # Get endpoint information
-            endpoint_info = self._extract_endpoint_info(api_spec, endpoint_path, method)
-            
-            # Retrieve relevant documentation using RAG
-            relevant_docs = self.rag_system.retrieve_endpoint_examples(
-                endpoint_path, method, api_spec_id
-            )
-            
-            # Generate test cases
-            test_cases = []
-            test_types = test_types or [TestType.FUNCTIONAL, TestType.EDGE_CASE]
-            
-            for test_type in test_types:
-                cases_for_type = await self._generate_tests_for_type(
-                    api_spec=api_spec,
-                    endpoint_path=endpoint_path,
-                    method=method,
-                    endpoint_info=endpoint_info,
-                    test_type=test_type,
-                    relevant_docs=relevant_docs,
-                    count=count // len(test_types) + (1 if test_type == test_types[0] else 0),
-                    custom_context=custom_context
-                )
-                test_cases.extend(cases_for_type)
-            
-            logger.info(f"Generated {len(test_cases)} test cases for {method} {endpoint_path}")
-            return test_cases
-            
-        except Exception as e:
-            logger.error(f"Failed to generate test cases: {str(e)}")
-            raise TestGenerationError(f"Test generation failed: {str(e)}")
-
-    async def _generate_tests_for_type(
-        self,
-        api_spec: APISpecification,
-        endpoint_path: str,
-        method: str,
-        endpoint_info: Dict[str, Any],
-        test_type: TestType,
-        relevant_docs: List[Dict[str, Any]],
-        count: int,
-        custom_context: Optional[str] = None
-    ) -> List[TestCase]:
-        """Generate test cases for a specific test type."""
+        # Get API specification
+        api_spec = self.db.query(APISpecification).filter(
+            APISpecification.id == api_spec_id
+        ).first()
         
-        # Prepare context for the LLM
-        context = self._prepare_generation_context(
-            api_spec, endpoint_info, relevant_docs, test_type, custom_context
-        )
+        if not api_spec:
+            raise ValueError(f"API specification with ID {api_spec_id} not found")
         
-        # Create prompt based on test type
-        prompt = self._create_prompt_for_test_type(
-            test_type, endpoint_path, method, context, count
-        )
+        # Get endpoint information
+        endpoint_info = self._get_endpoint_info(api_spec, endpoint_path, method)
         
-        # Generate tests using LLM
-        with get_openai_callback() as cb:
-            response = await self._call_llm(prompt)
+        # Generate test cases
+        test_cases = []
+        test_types = test_types or [TestType.FUNCTIONAL, TestType.EDGE_CASE]
+        
+        for test_type in test_types:
+            type_count = count // len(test_types)
+            if test_type == test_types[-1]:  # Add remainder to last type
+                type_count += count % len(test_types)
             
-            # Log the generation request
-            log_entry = AIGenerationLog(
-                prompt_template=prompt.template if hasattr(prompt, 'template') else str(prompt),
-                prompt_variables=context,
-                final_prompt=str(prompt),
-                ai_model=self.model_name,
-                raw_response=response,
-                generation_time_ms=cb.total_time * 1000 if hasattr(cb, 'total_time') else None,
-                token_usage={
-                    "prompt_tokens": cb.prompt_tokens,
-                    "completion_tokens": cb.completion_tokens,
-                    "total_tokens": cb.total_tokens,
-                    "total_cost": cb.total_cost
-                } if cb else None,
-                temperature=0.7
-            )
-        
-        try:
-            # Parse the LLM response
-            parsed_tests = self._parse_llm_response(response)
-            
-            # Create TestCase objects
-            test_cases = []
-            for test_data in parsed_tests:
-                test_case = self._create_test_case_object(
-                    api_spec.id,
-                    endpoint_path,
-                    method,
-                    test_type,
-                    test_data,
-                    context
-                )
-                
-                if test_case:
-                    test_cases.append(test_case)
-            
-            # Mark generation as successful
-            log_entry.validation_passed = True
-            log_entry.parsed_response = parsed_tests
-            
-        except Exception as e:
-            logger.error(f"Failed to parse LLM response: {str(e)}")
-            log_entry.validation_passed = False
-            log_entry.validation_errors = [str(e)]
-            test_cases = []
-        
-        # Save generation log
-        self.db.add(log_entry)
-        self.db.commit()
-        
-        return test_cases
-
-    def _prepare_generation_context(
-        self,
-        api_spec: APISpecification,
-        endpoint_info: Dict[str, Any],
-        relevant_docs: List[Dict[str, Any]],
-        test_type: TestType,
-        custom_context: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Prepare context for test generation."""
-        
-        context = {
-            "api_name": api_spec.name,
-            "api_version": api_spec.version,
-            "api_description": api_spec.description,
-            "base_url": api_spec.base_url,
-            "endpoint_info": endpoint_info,
-            "test_type": test_type.value,
-            "relevant_examples": [doc["content"] for doc in relevant_docs[:3]],
-            "custom_context": custom_context or ""
-        }
-        
-        return context
-
-    def _create_prompt_for_test_type(
-        self,
-        test_type: TestType,
-        endpoint_path: str,
-        method: str,
-        context: Dict[str, Any],
-        count: int
-    ) -> ChatPromptTemplate:
-        """Create a prompt template for the specific test type."""
-        
-        base_system_message = """You are an expert API testing engineer. Your task is to generate comprehensive test cases for API endpoints. 
-
-Generate test cases as JSON objects with the following structure:
-{
-    "name": "descriptive test name",
-    "description": "what the test validates",
-    "test_data": {
-        "headers": {},
-        "query_params": {},
-        "body": {},
-        "path_params": {}
-    },
-    "expected_response": {
-        "status_code": 200,
-        "body_schema": {},
-        "headers": {}
-    },
-    "assertions": [
-        "response.status_code == 200",
-        "response.json()['field'] == 'expected_value'"
-    ]
-}
-
-API Context:
-- API Name: {api_name}
-- Version: {api_version}
-- Description: {api_description}
-- Base URL: {base_url}
-
-Endpoint Information:
-{endpoint_info}
-
-Relevant Examples:
-{relevant_examples}
-
-Additional Context:
-{custom_context}"""
-
-        type_specific_prompts = {
-            TestType.FUNCTIONAL: """
-Generate {count} functional test cases for {method} {endpoint_path}.
-Focus on:
-- Valid request scenarios
-- Different input combinations
-- Success path validation
-- Response structure verification
-""",
-            TestType.EDGE_CASE: """
-Generate {count} edge case test cases for {method} {endpoint_path}.
-Focus on:
-- Boundary value testing
-- Invalid input scenarios
-- Missing required parameters
-- Malformed requests
-- Unusual but valid inputs
-""",
-            TestType.SECURITY: """
-Generate {count} security test cases for {method} {endpoint_path}.
-Focus on:
-- Authentication bypass attempts
-- Authorization testing
-- Input injection (SQL, XSS, etc.)
-- Rate limiting
-- Data exposure risks
-""",
-            TestType.PERFORMANCE: """
-Generate {count} performance test cases for {method} {endpoint_path}.
-Focus on:
-- Load testing scenarios
-- Response time validation
-- Resource usage monitoring
-- Concurrent request handling
-"""
-        }
-        
-        human_message = type_specific_prompts.get(test_type, type_specific_prompts[TestType.FUNCTIONAL])
-        
-        return ChatPromptTemplate.from_messages([
-            SystemMessage(content=base_system_message),
-            HumanMessage(content=human_message)
-        ]).partial(**context, count=count, method=method, endpoint_path=endpoint_path)
-
-    async def _call_llm(self, prompt: ChatPromptTemplate) -> str:
-        """Call the LLM with the prepared prompt."""
-        try:
-            messages = await prompt.aformat_messages()
-            response = await self.chat_model.agenerate([messages])
-            return response.generations[0][0].text
-        except Exception as e:
-            logger.error(f"LLM call failed: {str(e)}")
-            raise TestGenerationError(f"LLM call failed: {str(e)}")
-
-    def _parse_llm_response(self, response: str) -> List[Dict[str, Any]]:
-        """Parse the LLM response to extract test case data."""
-        try:
-            # Try to parse as JSON directly
-            if response.strip().startswith('['):
-                return json.loads(response)
-            
-            # Look for JSON blocks in the response
-            import re
-            json_blocks = re.findall(r'\{[^{}]*\}|\[[^\[\]]*\]', response, re.DOTALL)
-            
-            parsed_tests = []
-            for block in json_blocks:
+            if self.openai_client:
+                # Use AI generation
                 try:
-                    test_data = json.loads(block)
-                    if isinstance(test_data, list):
-                        parsed_tests.extend(test_data)
-                    else:
-                        parsed_tests.append(test_data)
-                except json.JSONDecodeError:
-                    continue
-            
-            if not parsed_tests:
-                # Fallback: try to extract key information manually
-                parsed_tests = self._manual_parse_response(response)
-            
-            return parsed_tests
-            
-        except Exception as e:
-            logger.error(f"Failed to parse LLM response: {str(e)}")
-            return []
-
-    def _manual_parse_response(self, response: str) -> List[Dict[str, Any]]:
-        """Manually parse response when JSON parsing fails."""
-        # This is a simplified fallback parser
-        # In a production system, you'd want more robust parsing
-        tests = []
+                    ai_test_cases = await self._generate_with_openai(
+                        api_spec, endpoint_path, method, test_type, 
+                        type_count, endpoint_info, custom_context
+                    )
+                    test_cases.extend(ai_test_cases)
+                except Exception as e:
+                    logger.error(f"AI generation failed: {str(e)}, falling back to templates")
+                    template_test_cases = self._generate_with_templates(
+                        api_spec, endpoint_path, method, test_type, type_count, endpoint_info
+                    )
+                    test_cases.extend(template_test_cases)
+            else:
+                # Use template-based generation
+                template_test_cases = self._generate_with_templates(
+                    api_spec, endpoint_path, method, test_type, type_count, endpoint_info
+                )
+                test_cases.extend(template_test_cases)
         
-        lines = response.split('\n')
-        current_test = {}
-        
-        for line in lines:
-            line = line.strip()
-            
-            if 'name:' in line.lower():
-                if current_test:
-                    tests.append(current_test)
-                current_test = {"name": line.split(':', 1)[1].strip()}
-            elif 'description:' in line.lower() and current_test:
-                current_test["description"] = line.split(':', 1)[1].strip()
-            elif line and not current_test.get("test_data"):
-                current_test["test_data"] = {"headers": {}, "query_params": {}, "body": {}}
-                current_test["expected_response"] = {"status_code": 200}
-                current_test["assertions"] = []
-        
-        if current_test:
-            tests.append(current_test)
-        
-        return tests
-
-    def _create_test_case_object(
-        self,
-        api_spec_id: int,
-        endpoint_path: str,
-        method: str,
-        test_type: TestType,
-        test_data: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> Optional[TestCase]:
-        """Create a TestCase object from parsed test data."""
-        try:
+        # Save test cases to database
+        saved_test_cases = []
+        for tc_data in test_cases:
             test_case = TestCase(
                 api_spec_id=api_spec_id,
-                name=test_data.get("name", f"{test_type.value}_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
-                description=test_data.get("description", ""),
-                test_type=test_type,
+                name=tc_data["name"],
+                description=tc_data["description"],
+                test_type=tc_data["test_type"],
                 endpoint=endpoint_path,
                 method=method.upper(),
-                test_data=test_data.get("test_data", {}),
-                expected_response=test_data.get("expected_response", {}),
-                assertions=test_data.get("assertions", []),
-                generated_by_llm=True,
-                generation_context=context
+                test_data=tc_data["test_data"],
+                expected_response=tc_data.get("expected_response"),
+                assertions=tc_data.get("assertions", []),
+                generated_by_llm=tc_data.get("generated_by_llm", False),
+                generation_prompt=tc_data.get("generation_prompt"),
+                generation_context=tc_data.get("generation_context")
             )
             
             self.db.add(test_case)
-            self.db.commit()
-            self.db.refresh(test_case)
-            
-            return test_case
-            
-        except Exception as e:
-            logger.error(f"Failed to create test case object: {str(e)}")
-            self.db.rollback()
-            return None
-
-    def _extract_endpoint_info(
-        self,
-        api_spec: APISpecification,
-        endpoint_path: str,
-        method: str
-    ) -> Dict[str, Any]:
-        """Extract endpoint information from API specification."""
+            self.db.flush()  # Get the ID
+            saved_test_cases.append(test_case)
         
-        try:
-            parsed_endpoints = api_spec.parsed_endpoints or {}
-            endpoint_info = parsed_endpoints.get(endpoint_path, {})
-            method_info = endpoint_info.get(method.upper(), {})
-            
-            return {
-                "path": endpoint_path,
-                "method": method.upper(),
-                "summary": method_info.get("summary", ""),
-                "description": method_info.get("description", ""),
-                "parameters": method_info.get("parameters", []),
-                "responses": method_info.get("responses", {}),
-                "requestBody": method_info.get("requestBody", {}),
-                "security": method_info.get("security", []),
-                "tags": method_info.get("tags", [])
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to extract endpoint info: {str(e)}")
-            return {
-                "path": endpoint_path,
-                "method": method.upper(),
-                "summary": "",
-                "description": "",
-                "parameters": [],
-                "responses": {},
-                "requestBody": {},
-                "security": [],
-                "tags": []
-            }
-
+        self.db.commit()
+        logger.info(f"Generated and saved {len(saved_test_cases)} test cases for {method} {endpoint_path}")
+        return saved_test_cases
+    
     async def generate_test_suite(
         self,
         api_spec_id: int,
@@ -463,94 +130,356 @@ Focus on:
         endpoint_filter: Optional[List[str]] = None,
         test_types: Optional[List[TestType]] = None
     ) -> Dict[str, Any]:
-        """
-        Generate a complete test suite for an API specification.
+        """Generate a complete test suite for an API specification."""
         
-        Args:
-            api_spec_id: API specification ID
-            include_all_endpoints: Whether to include all endpoints
-            endpoint_filter: Specific endpoints to include
-            test_types: Types of tests to generate
-            
-        Returns:
-            Dictionary with generation results
-        """
-        try:
-            api_spec = self.db.query(APISpecification).filter(
-                APISpecification.id == api_spec_id
-            ).first()
-            
-            if not api_spec:
-                raise TestGenerationError(f"API specification with ID {api_spec_id} not found")
-            
-            # Get endpoints to process
-            endpoints_to_process = []
-            parsed_endpoints = api_spec.parsed_endpoints or {}
-            
-            for path, path_info in parsed_endpoints.items():
-                if endpoint_filter and path not in endpoint_filter:
+        api_spec = self.db.query(APISpecification).filter(
+            APISpecification.id == api_spec_id
+        ).first()
+        
+        if not api_spec:
+            raise ValueError(f"API specification with ID {api_spec_id} not found")
+        
+        endpoints = api_spec.parsed_endpoints or {}
+        all_test_cases = []
+        
+        for endpoint_path, methods in endpoints.items():
+            if not include_all_endpoints and endpoint_filter:
+                if endpoint_path not in endpoint_filter:
                     continue
-                
-                for method in path_info.keys():
-                    if method.upper() in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
-                        endpoints_to_process.append((path, method.upper()))
             
-            # Generate test cases for each endpoint
-            all_test_cases = []
-            generation_stats = {
-                "total_endpoints": len(endpoints_to_process),
-                "successful_generations": 0,
-                "failed_generations": 0,
-                "total_test_cases": 0
+            for method in methods.keys():
+                if method.upper() in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
+                    try:
+                        test_cases = await self.generate_test_cases(
+                            api_spec_id=api_spec_id,
+                            endpoint_path=endpoint_path,
+                            method=method,
+                            test_types=test_types,
+                            count=3,
+                            include_edge_cases=True
+                        )
+                        all_test_cases.extend(test_cases)
+                    except Exception as e:
+                        logger.error(f"Failed to generate tests for {method} {endpoint_path}: {str(e)}")
+        
+        return {
+            "test_cases": all_test_cases,
+            "statistics": {
+                "total_test_cases": len(all_test_cases),
+                "endpoints_covered": len(endpoints),
+                "test_types_generated": list(set(tc.test_type for tc in all_test_cases))
             }
-            
-            for path, method in endpoints_to_process:
-                try:
-                    test_cases = await self.generate_test_cases(
-                        api_spec_id=api_spec_id,
-                        endpoint_path=path,
-                        method=method,
-                        test_types=test_types,
-                        count=3
-                    )
-                    
-                    all_test_cases.extend(test_cases)
-                    generation_stats["successful_generations"] += 1
-                    generation_stats["total_test_cases"] += len(test_cases)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to generate tests for {method} {path}: {str(e)}")
-                    generation_stats["failed_generations"] += 1
-            
-            return {
-                "test_cases": all_test_cases,
-                "statistics": generation_stats,
-                "api_spec_id": api_spec_id
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to generate test suite: {str(e)}")
-            raise TestGenerationError(f"Test suite generation failed: {str(e)}")
-
-    def get_generation_history(
+        }
+    
+    async def _generate_with_openai(
         self,
-        api_spec_id: Optional[int] = None,
-        limit: int = 50
-    ) -> List[AIGenerationLog]:
-        """Get AI generation history."""
-        try:
-            query = self.db.query(AIGenerationLog)
-            if api_spec_id:
-                # Join with TestCase to filter by API spec
-                query = query.join(TestCase).filter(TestCase.api_spec_id == api_spec_id)
+        api_spec: APISpecification,
+        endpoint_path: str,
+        method: str,
+        test_type: TestType,
+        count: int,
+        endpoint_info: Dict[str, Any],
+        custom_context: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Generate test cases using OpenAI."""
+        
+        prompt = self._build_generation_prompt(
+            api_spec, endpoint_path, method, test_type, count, endpoint_info, custom_context
+        )
+        
+        start_time = datetime.utcnow()
+        
+        response = self.openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+            messages=[
+                {"role": "system", "content": "You are an expert API testing engineer. Generate comprehensive test cases in JSON format."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        
+        generation_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        
+        # Parse the response
+        content = response.choices[0].message.content
+        test_cases_data = self._parse_openai_response(content, test_type)
+        
+        # Log the generation
+        self._log_ai_generation(
+            prompt, content, test_cases_data, generation_time, 
+            response.usage._asdict() if response.usage else None
+        )
+        
+        return test_cases_data[:count]  # Limit to requested count
+    
+    def _generate_with_templates(
+        self,
+        api_spec: APISpecification,
+        endpoint_path: str,
+        method: str,
+        test_type: TestType,
+        count: int,
+        endpoint_info: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Generate test cases using templates (fallback)."""
+        
+        test_cases = []
+        
+        for i in range(count):
+            if test_type == TestType.FUNCTIONAL:
+                test_case = {
+                    "name": f"Test {method} {endpoint_path} - Functional {i+1}",
+                    "description": f"Functional test for {method} {endpoint_path}",
+                    "test_type": test_type,
+                    "test_data": self._generate_functional_test_data(endpoint_info, method),
+                    "expected_response": {"status_code": 200},
+                    "assertions": [
+                        {"type": "status_code", "expected": 200},
+                        {"type": "response_time", "max_ms": 5000}
+                    ],
+                    "generated_by_llm": False
+                }
+            elif test_type == TestType.EDGE_CASE:
+                test_case = {
+                    "name": f"Test {method} {endpoint_path} - Edge Case {i+1}",
+                    "description": f"Edge case test for {method} {endpoint_path}",
+                    "test_type": test_type,
+                    "test_data": self._generate_edge_case_test_data(endpoint_info, method),
+                    "expected_response": {"status_code": [400, 404, 422]},
+                    "assertions": [
+                        {"type": "status_code_in", "expected": [400, 404, 422]},
+                        {"type": "response_time", "max_ms": 5000}
+                    ],
+                    "generated_by_llm": False
+                }
+            else:
+                test_case = {
+                    "name": f"Test {method} {endpoint_path} - {test_type.value.title()} {i+1}",
+                    "description": f"{test_type.value.title()} test for {method} {endpoint_path}",
+                    "test_type": test_type,
+                    "test_data": self._generate_basic_test_data(endpoint_info, method),
+                    "expected_response": {"status_code": 200},
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                    "generated_by_llm": False
+                }
             
-            return query.order_by(AIGenerationLog.created_at.desc()).limit(limit).all()
+            test_cases.append(test_case)
+        
+        return test_cases
+    
+    def _build_generation_prompt(
+        self,
+        api_spec: APISpecification,
+        endpoint_path: str,
+        method: str,
+        test_type: TestType,
+        count: int,
+        endpoint_info: Dict[str, Any],
+        custom_context: Optional[str] = None
+    ) -> str:
+        """Build the prompt for OpenAI generation."""
+        
+        base_url = api_spec.base_url or "https://api.example.com"
+        
+        prompt = f"""
+Generate {count} comprehensive {test_type.value} test cases for the following API endpoint:
+
+API: {api_spec.name} (v{api_spec.version})
+Base URL: {base_url}
+Endpoint: {method.upper()} {endpoint_path}
+Description: {api_spec.description or 'No description provided'}
+
+Endpoint Details:
+{json.dumps(endpoint_info, indent=2)}
+
+Requirements:
+- Generate {test_type.value} test cases
+- Include realistic test data
+- Specify expected responses
+- Add appropriate assertions
+- Consider authentication if needed
+- Include edge cases for error scenarios
+
+{f"Additional Context: {custom_context}" if custom_context else ""}
+
+Return the test cases as a JSON array with this structure:
+[
+  {{
+    "name": "Test case name",
+    "description": "Detailed description",
+    "test_data": {{
+      "headers": {{}},
+      "query_params": {{}},
+      "path_params": {{}},
+      "body": {{}}
+    }},
+    "expected_response": {{
+      "status_code": 200,
+      "body_contains": ["key", "value"]
+    }},
+    "assertions": [
+      {{"type": "status_code", "expected": 200}},
+      {{"type": "response_time", "max_ms": 5000}}
+    ]
+  }}
+]
+"""
+        return prompt.strip()
+    
+    def _parse_openai_response(self, content: str, test_type: TestType) -> List[Dict[str, Any]]:
+        """Parse OpenAI response into test case data."""
+        
+        try:
+            # Try to extract JSON from the response
+            start_idx = content.find('[')
+            end_idx = content.rfind(']') + 1
+            
+            if start_idx != -1 and end_idx > start_idx:
+                json_str = content[start_idx:end_idx]
+                test_cases_raw = json.loads(json_str)
+                
+                # Process and validate test cases
+                test_cases = []
+                for tc in test_cases_raw:
+                    processed_tc = {
+                        "name": tc.get("name", f"AI Generated {test_type.value} Test"),
+                        "description": tc.get("description", "AI generated test case"),
+                        "test_type": test_type,
+                        "test_data": tc.get("test_data", {}),
+                        "expected_response": tc.get("expected_response", {}),
+                        "assertions": tc.get("assertions", []),
+                        "generated_by_llm": True,
+                        "generation_context": {"model": "openai", "test_type": test_type.value}
+                    }
+                    test_cases.append(processed_tc)
+                
+                return test_cases
+            
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.warning(f"Failed to parse OpenAI response: {str(e)}")
+        
+        # Return empty list if parsing fails
+        return []
+    
+    def _get_endpoint_info(self, api_spec: APISpecification, endpoint_path: str, method: str) -> Dict[str, Any]:
+        """Extract endpoint information from API specification."""
+        
+        endpoints = api_spec.parsed_endpoints or {}
+        path_info = endpoints.get(endpoint_path, {})
+        method_info = path_info.get(method.lower(), {})
+        
+        return {
+            "path": endpoint_path,
+            "method": method.upper(),
+            "summary": method_info.get("summary", ""),
+            "description": method_info.get("description", ""),
+            "parameters": method_info.get("parameters", []),
+            "responses": method_info.get("responses", {}),
+            "tags": method_info.get("tags", []),
+            "security": method_info.get("security", [])
+        }
+    
+    def _generate_functional_test_data(self, endpoint_info: Dict[str, Any], method: str) -> Dict[str, Any]:
+        """Generate functional test data."""
+        
+        test_data = {
+            "headers": {"Content-Type": "application/json"},
+            "query_params": {},
+            "path_params": {},
+            "body": {}
+        }
+        
+        # Add basic parameters based on endpoint info
+        for param in endpoint_info.get("parameters", []):
+            param_name = param.get("name", "param")
+            param_in = param.get("in", "query")
+            
+            if param_in == "query":
+                test_data["query_params"][param_name] = "test_value"
+            elif param_in == "path":
+                test_data["path_params"][param_name] = "123"
+            elif param_in == "header":
+                test_data["headers"][param_name] = "test_value"
+        
+        # Add body for POST/PUT/PATCH requests
+        if method.upper() in ["POST", "PUT", "PATCH"]:
+            test_data["body"] = {"data": "test_value"}
+        
+        return test_data
+    
+    def _generate_edge_case_test_data(self, endpoint_info: Dict[str, Any], method: str) -> Dict[str, Any]:
+        """Generate edge case test data."""
+        
+        test_data = {
+            "headers": {"Content-Type": "application/json"},
+            "query_params": {},
+            "path_params": {},
+            "body": {}
+        }
+        
+        # Add invalid/edge case parameters
+        for param in endpoint_info.get("parameters", []):
+            param_name = param.get("name", "param")
+            param_in = param.get("in", "query")
+            
+            if param_in == "query":
+                test_data["query_params"][param_name] = ""  # Empty value
+            elif param_in == "path":
+                test_data["path_params"][param_name] = "invalid_id"
+            elif param_in == "header":
+                test_data["headers"][param_name] = ""
+        
+        # Add invalid body for POST/PUT/PATCH requests
+        if method.upper() in ["POST", "PUT", "PATCH"]:
+            test_data["body"] = {}  # Empty body
+        
+        return test_data
+    
+    def _generate_basic_test_data(self, endpoint_info: Dict[str, Any], method: str) -> Dict[str, Any]:
+        """Generate basic test data."""
+        return self._generate_functional_test_data(endpoint_info, method)
+    
+    def _log_ai_generation(
+        self,
+        prompt: str,
+        response: str,
+        parsed_response: List[Dict[str, Any]],
+        generation_time_ms: float,
+        token_usage: Optional[Dict[str, Any]] = None
+    ):
+        """Log AI generation for debugging and optimization."""
+        
+        try:
+            log_entry = AIGenerationLog(
+                prompt_template="openai_test_generation",
+                final_prompt=prompt,
+                ai_model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+                raw_response=response,
+                parsed_response=parsed_response,
+                generation_time_ms=generation_time_ms,
+                token_usage=token_usage,
+                validation_passed=len(parsed_response) > 0
+            )
+            
+            self.db.add(log_entry)
+            self.db.commit()
             
         except Exception as e:
-            logger.error(f"Failed to get generation history: {str(e)}")
-            return []
-
+            logger.warning(f"Failed to log AI generation: {str(e)}")
+    
+    def get_generation_history(self, api_spec_id: Optional[int] = None, limit: int = 50) -> List[AIGenerationLog]:
+        """Get AI generation history."""
+        
+        query = self.db.query(AIGenerationLog)
+        
+        if api_spec_id:
+            # Filter by API spec through test cases
+            query = query.join(TestCase).filter(TestCase.api_spec_id == api_spec_id)
+        
+        return query.order_by(AIGenerationLog.created_at.desc()).limit(limit).all()
+    
     def __del__(self):
-        """Clean up resources."""
+        """Clean up database session."""
         if hasattr(self, 'db'):
             self.db.close()

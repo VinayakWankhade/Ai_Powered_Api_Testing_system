@@ -1,17 +1,27 @@
 """
-Sandboxed test execution engine with comprehensive logging and coverage tracking.
+Simplified test execution engine for MVP.
 """
 
 import asyncio
 import time
 import json
 import traceback
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    httpx = None
+    HTTPX_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    requests = None
+    REQUESTS_AVAILABLE = False
 
 from ..database.models import (
     TestCase, ExecutionSession, TestExecution, TestStatus, 
@@ -36,16 +46,15 @@ class APITestExecutor:
         self.max_concurrent_tests = max_concurrent_tests
         self.timeout_seconds = timeout_seconds
         
-        # Setup HTTP session with retries
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            status_forcelist=[429, 500, 502, 503, 504],
-            method_whitelist=["HEAD", "GET", "OPTIONS", "POST", "PUT", "DELETE", "PATCH"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        # Setup HTTP client
+        if HTTPX_AVAILABLE:
+            self.client = httpx.AsyncClient(timeout=timeout_seconds)
+            logger.info("Using httpx for async HTTP requests")
+        elif REQUESTS_AVAILABLE:
+            self.session = requests.Session()
+            logger.info("Using requests for HTTP requests")
+        else:
+            raise ImportError("Neither httpx nor requests is available. Please install one of them.")
         
         logger.info(f"Test executor initialized with max_concurrent_tests={max_concurrent_tests}, timeout={timeout_seconds}s")
 
@@ -274,15 +283,12 @@ class APITestExecutor:
         
         return request_data
 
-    async def _make_http_request(self, request_data: Dict[str, Any]) -> requests.Response:
+    async def _make_http_request(self, request_data: Dict[str, Any]):
         """Make the actual HTTP request asynchronously."""
         
-        loop = asyncio.get_event_loop()
-        
-        # Run the request in a thread pool to avoid blocking
-        with ThreadPoolExecutor() as executor:
-            future = executor.submit(
-                self.session.request,
+        if HTTPX_AVAILABLE:
+            # Use httpx for async requests
+            response = await self.client.request(
                 method=request_data["method"],
                 url=request_data["url"],
                 headers=request_data.get("headers", {}),
@@ -291,14 +297,32 @@ class APITestExecutor:
                 data=request_data.get("data"),
                 timeout=request_data["timeout"]
             )
-            
-            response = await loop.run_in_executor(None, lambda: future.result())
             return response
+        elif REQUESTS_AVAILABLE:
+            # Use requests with thread pool
+            from concurrent.futures import ThreadPoolExecutor
+            
+            loop = asyncio.get_event_loop()
+            
+            with ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    self.session.request,
+                    method=request_data["method"],
+                    url=request_data["url"],
+                    headers=request_data.get("headers", {}),
+                    params=request_data.get("params", {}),
+                    json=request_data.get("json"),
+                    data=request_data.get("data"),
+                    timeout=request_data["timeout"]
+                )
+                
+                response = await loop.run_in_executor(None, lambda: future.result())
+                return response
 
     def _run_assertions(
         self,
         test_case: TestCase,
-        response: requests.Response
+        response: Any  # Can be httpx.Response or requests.Response
     ) -> Dict[str, Any]:
         """Run test assertions and return results."""
         
@@ -383,7 +407,7 @@ class APITestExecutor:
     def _calculate_coverage_contribution(
         self,
         test_case: TestCase,
-        response: requests.Response
+        response: Any  # Can be httpx.Response or requests.Response
     ) -> Dict[str, Any]:
         """Calculate what this test execution contributed to coverage."""
         
@@ -391,7 +415,7 @@ class APITestExecutor:
             "endpoint": test_case.endpoint,
             "method": test_case.method,
             "status_code": response.status_code,
-            "response_time_category": self._categorize_response_time(response.elapsed.total_seconds() * 1000),
+            "response_time_category": self._categorize_response_time(getattr(response, 'elapsed', type('obj', (object,), {'total_seconds': lambda: 0.1})).total_seconds() * 1000),
             "headers_tested": list(test_case.test_data.get("headers", {}).keys()) if test_case.test_data else [],
             "query_params_tested": list(test_case.test_data.get("query_params", {}).keys()) if test_case.test_data else [],
             "body_fields_tested": self._extract_body_fields(test_case.test_data.get("body", {})) if test_case.test_data else []
@@ -596,3 +620,214 @@ class APITestExecutor:
             self.db.close()
         if hasattr(self, 'session'):
             self.session.close()
+
+# Simplified HybridTestExecutor for MVP (alias to APITestExecutor)
+class HybridTestExecutor:
+    """
+    Hybrid test executor that combines different execution strategies.
+    For MVP, this is a simplified version that delegates to APITestExecutor.
+    """
+    
+    def __init__(self, max_concurrent_tests: int = 5, timeout_seconds: int = 300):
+        self.executor = APITestExecutor(max_concurrent_tests, timeout_seconds)
+    
+    async def execute_test_suite(
+        self,
+        api_spec_id: int,
+        test_cases: List[TestCase],
+        execution_config: Dict[str, Any] = None,
+        max_concurrent: int = 5,
+        timeout: int = 300
+    ) -> Dict[str, Any]:
+        """Execute a test suite and return results."""
+        try:
+            # Extract test case IDs
+            test_case_ids = [tc.id for tc in test_cases]
+            
+            # Execute the test session
+            session = await self.executor.execute_test_session(
+                api_spec_id=api_spec_id,
+                test_case_ids=test_case_ids,
+                session_name=f"Test Suite Execution",
+                trigger="api"
+            )
+            
+            # Get all test executions for this session
+            from ..database.connection import get_db_session
+            db = get_db_session()
+            try:
+                test_executions = db.query(TestExecution).filter(
+                    TestExecution.session_id == session.id
+                ).all()
+                
+                # Calculate results
+                total_tests = len(test_executions)
+                passed_tests = sum(1 for ex in test_executions if ex.status == TestStatus.PASSED)
+                failed_tests = sum(1 for ex in test_executions if ex.status == TestStatus.FAILED)
+                skipped_tests = sum(1 for ex in test_executions if ex.status == TestStatus.SKIPPED)
+                error_tests = sum(1 for ex in test_executions if ex.status == TestStatus.ERROR)
+                
+                success_rate = (passed_tests / total_tests * 100) if total_tests > 0 else 0
+                
+                return {
+                    "session_id": session.id,
+                    "status": "completed",
+                    "total_tests": total_tests,
+                    "passed_tests": passed_tests,
+                    "failed_tests": failed_tests,
+                    "skipped_tests": skipped_tests,
+                    "error_tests": error_tests,
+                    "success_rate": success_rate,
+                    "execution_time": session.duration_seconds or 0,
+                    "started_at": session.started_at.isoformat(),
+                    "completed_at": session.completed_at.isoformat() if session.completed_at else None,
+                    "coverage_percentage": getattr(session, 'endpoint_coverage', {}).get('percentage', 0),
+                    "summary": {
+                        "success_rate": success_rate,
+                        "avg_response_time": sum(ex.response_time_ms or 0 for ex in test_executions) / len(test_executions) if test_executions else 0,
+                        "endpoints_tested": len(set(ex.test_case.endpoint for ex in test_executions if ex.test_case))
+                    }
+                }
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Test suite execution failed: {str(e)}")
+            return {
+                "session_id": None,
+                "status": "error",
+                "total_tests": len(test_cases),
+                "passed_tests": 0,
+                "failed_tests": 0,
+                "skipped_tests": 0,
+                "error_tests": len(test_cases),
+                "success_rate": 0,
+                "execution_time": 0,
+                "started_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.utcnow().isoformat(),
+                "coverage_percentage": 0,
+                "error": str(e)
+            }
+    
+    async def create_execution_session(
+        self,
+        api_spec_id: int,
+        test_case_ids: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        """Create an execution session."""
+        try:
+            from ..database.connection import get_db_session
+            db = get_db_session()
+            try:
+                session = ExecutionSession(
+                    api_spec_id=api_spec_id,
+                    name=f"Background Test Session {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    trigger="async_api",
+                    started_at=datetime.utcnow()
+                )
+                
+                db.add(session)
+                db.commit()
+                db.refresh(session)
+                
+                return {
+                    "session_id": session.id,
+                    "status": "created"
+                }
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Failed to create execution session: {str(e)}")
+            raise TestExecutionError(f"Session creation failed: {str(e)}")
+    
+    async def execute_test_suite_background(
+        self,
+        session_id: int,
+        api_spec_id: int,
+        test_case_ids: Optional[List[int]],
+        execution_config: Dict[str, Any],
+        max_concurrent: int,
+        timeout: int
+    ):
+        """Execute test suite in background (simplified for MVP)."""
+        try:
+            logger.info(f"Starting background execution for session {session_id}")
+            # For MVP, we just execute normally
+            # In a full implementation, this would be more sophisticated
+            await self.executor.execute_test_session(
+                api_spec_id=api_spec_id,
+                test_case_ids=test_case_ids,
+                session_name=f"Background Session {session_id}",
+                trigger="background"
+            )
+        except Exception as e:
+            logger.error(f"Background execution failed: {str(e)}")
+    
+    async def get_execution_status(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Get execution status for a session."""
+        try:
+            from ..database.connection import get_db_session
+            db = get_db_session()
+            try:
+                session = db.query(ExecutionSession).filter(
+                    ExecutionSession.id == session_id
+                ).first()
+                
+                if not session:
+                    return None
+                
+                # Get execution progress
+                test_executions = db.query(TestExecution).filter(
+                    TestExecution.session_id == session_id
+                ).all()
+                
+                total_tests = session.total_tests or 0
+                completed_tests = len([ex for ex in test_executions if ex.status != TestStatus.RUNNING])
+                
+                progress_percentage = (completed_tests / total_tests * 100) if total_tests > 0 else 0
+                
+                return {
+                    "status": "completed" if session.completed_at else "running",
+                    "progress_percentage": progress_percentage,
+                    "current_test": None,  # Simplified for MVP
+                    "tests_completed": completed_tests,
+                    "tests_remaining": total_tests - completed_tests,
+                    "estimated_completion": None  # Simplified for MVP
+                }
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Failed to get execution status: {str(e)}")
+            return None
+    
+    async def cancel_execution(self, session_id: int) -> bool:
+        """Cancel an execution session."""
+        try:
+            from ..database.connection import get_db_session
+            db = get_db_session()
+            try:
+                session = db.query(ExecutionSession).filter(
+                    ExecutionSession.id == session_id
+                ).first()
+                
+                if not session:
+                    return False
+                
+                # Mark as completed (simplified cancellation)
+                if not session.completed_at:
+                    session.completed_at = datetime.utcnow()
+                    session.duration_seconds = (session.completed_at - session.started_at).total_seconds()
+                    db.commit()
+                    
+                    logger.info(f"Cancelled execution session {session_id}")
+                    return True
+                    
+                return False
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Failed to cancel execution: {str(e)}")
+            return False

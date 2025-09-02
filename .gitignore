@@ -149,3 +149,19 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn/
+dist/
+build/
+
+# Demo and test files
+*.db
+demo_server.db
+validation.db
+test_startup.db
