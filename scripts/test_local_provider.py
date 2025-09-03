@@ -5,11 +5,10 @@ from pathlib import Path
 
 # Ensure src/ is on PYTHONPATH
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from llm_gateway import LLMGateway  # noqa: E402
+from src.llm_gateway import LLMGateway  # noqa: E402
 
 
 async def main():
